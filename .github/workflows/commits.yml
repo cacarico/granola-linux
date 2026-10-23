@@ -1,0 +1,31 @@
+name: commits
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  conventional:
+    name: conventional commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The PR title becomes the merge commit's subject, so it is held to the
+      # same rules as every commit on the branch.
+      - name: Check the PR title and commit subjects
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          {
+            printf '%s\n' "$TITLE"
+            git log --format=%s "$BASE..$HEAD"
+          } | sh .github/scripts/check-commits.sh

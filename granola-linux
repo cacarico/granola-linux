@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+# granola-linux: run Granola, the AI meeting notepad, on Linux.
+#
+# Granola ships for macOS and Windows only, but it is an Electron app: the
+# macOS disk image holds the app's JavaScript next to a macOS Electron runtime.
+# This script pairs that JavaScript with the matching Linux Electron runtime,
+# rebuilds the one native module Granola needs from the sources in the image,
+# and patches the two things that keep it from running on Linux. It does not
+# redistribute anything of Granola's: the image is downloaded from Granola's
+# own release endpoint, or given with --dmg.
+#
+# Nothing here needs root. Everything lands under the XDG directories.
+set -euo pipefail
+
+VERSION=0.1.0
+
+# Granola's release endpoint redirects to the current full disk image. The
+# download page serves a 1 MB stub that fetches the app at first launch on
+# macOS; that stub holds none of the app's files, so it is useless here.
+LATEST_URL='https://api.granola.ai/v1/download-latest'
+RELEASE_BASE='https://dr2v7l5emb758.cloudfront.net'
+ELECTRON_RELEASES='https://github.com/electron/electron/releases/download'
+ELECTRON_HEADERS='https://electronjs.org/headers'
+NODE_GYP='node-gyp@13.1.0'
+
+# Fallback 7-Zip, used only when the system has none that reads LZFSE images.
+# The checksum pins the build; the script refuses a file that does not match.
+SEVENZIP_URL='https://www.7-zip.org/a/7z2604-linux-x64.tar.xz'
+SEVENZIP_SHA256='fc0327ba27e89bd086cf426dff17d77de582953cdbbc10a6576540a06853ffcd'
+
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+BIN_DIR="${GRANOLA_LINUX_BIN_DIR:-$HOME/.local/bin}"
+
+ROOT="${GRANOLA_LINUX_HOME:-$DATA_HOME/granola-linux}"
+APP_DIR="$ROOT/app"
+LAUNCHER="$ROOT/granola"
+VERSION_FILE="$ROOT/version"
+CACHE_DIR="${GRANOLA_LINUX_CACHE:-$CACHE_HOME/granola-linux}"
+DESKTOP_FILE="$DATA_HOME/applications/granola.desktop"
+ICON="$ROOT/granola.png"
+USER_DATA="$CONFIG_HOME/Granola"
+
+# Paths inside the disk image.
+DMG_APP='Granola/Granola.app/Contents'
+DMG_RES="$DMG_APP/Resources"
+DMG_FRAMEWORK_PLIST="$DMG_APP/Frameworks/Electron Framework.framework/Versions/A/Resources/Info.plist"
+
+DRY_RUN=0
+FORCE=0
+ASSUME_YES=0
+DMG=''
+WANT_VERSION=''
+
+# --- output -----------------------------------------------------------------
+
+if [[ -t 1 ]]; then
+  c_step=$'\033[1;36m' c_bold=$'\033[1m' c_warn=$'\033[33m' c_err=$'\033[31m' c_off=$'\033[0m'
+else
+  c_step='' c_bold='' c_warn='' c_err='' c_off=''
+fi
+step() { printf '\n%s==>%s %s%s%s\n' "$c_step" "$c_off" "$c_bold" "$*" "$c_off"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf '%swarning:%s %s\n' "$c_warn" "$c_off" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$c_err" "$c_off" "$*" >&2; exit 1; }
+would() { printf '    would %s\n' "$*"; }
+
+usage() {
+  cat <<EOF
+granola-linux $VERSION: run Granola on Linux from its official macOS build.
+
+usage: granola-linux <command> [options]
+
+commands
+  install     download the current release (or use --dmg) and install it
+  uninstall   remove the install; --purge also removes Granola's user data
+  status      show what is installed and whether a newer release exists
+  help        show this text
+
+install options
+  --dmg FILE       use this disk image instead of downloading one
+  --version VER    download this release instead of the current one
+  --force          reinstall even if this version is already installed
+  --dry-run        print what would happen and change nothing
+
+uninstall options
+  --purge          also delete $USER_DATA (notes cache and login)
+  --yes            do not ask for confirmation
+
+environment
+  GRANOLA_LINUX_HOME     install root    (default $DATA_HOME/granola-linux)
+  GRANOLA_LINUX_CACHE    downloads       (default $CACHE_HOME/granola-linux)
+  GRANOLA_LINUX_BIN_DIR  launcher link   (default $HOME/.local/bin)
+EOF
+}
+
+# --- helpers ----------------------------------------------------------------
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found. Install it and run again."; }
+
+# Download $2 to $1 atomically.
+fetch() {
+  local out=$1 url=$2
+  mkdir -p "$(dirname "$out")"
+  info "downloading $url"
+  local progress=-sS
+  [[ -t 2 ]] && progress=--progress-bar
+  curl -fL --retry 3 "$progress" -o "$out.part" "$url" || die "download failed: $url"
+  mv "$out.part" "$out"
+}
+
+# Fail unless $1 has the SHA-256 $2. A failed check deletes the file so the
+# next run downloads it again instead of failing forever on a bad cache.
+check_sha256() {
+  local file=$1 want=$2 have
+  have=$(sha256sum "$file" | cut -d' ' -f1)
+  if [[ "$have" != "$want" ]]; then
+    rm -f "$file"
+    die "checksum mismatch for $(basename "$file") (deleted; run again to retry)"
+  fi
+}
+
+# Print the version of a 7-Zip binary, or nothing if it is not Igor Pavlov's.
+# p7zip 16.02, which most distributions ship, cannot read LZFSE-compressed
+# disk images; 7-Zip 21.02 and newer can.
+sevenzip_version() {
+  "$1" 2>/dev/null | head -2 | grep -oE '7-Zip( \[64\])?( \(z\))? [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+$' | head -1
+}
+
+sevenzip_ok() {
+  local v=$1
+  [[ -n "$v" ]] || return 1
+  [[ "${v%%.*}" -ge 22 ]] || { [[ "${v%%.*}" -eq 21 ]] && [[ "${v#*.}" -ge 2 ]]; }
+}
+
+find_sevenzip() {
+  local c v
+  for c in 7zz 7z; do
+    command -v "$c" >/dev/null 2>&1 || continue
+    v=$(sevenzip_version "$c")
+    if sevenzip_ok "$v"; then printf '%s\n' "$(command -v "$c")"; return 0; fi
+  done
+  local bin="$CACHE_DIR/7zz"
+  if [[ -x "$bin" ]] && sevenzip_ok "$(sevenzip_version "$bin")"; then printf '%s\n' "$bin"; return 0; fi
+  if (( DRY_RUN )); then printf '%s\n' "$bin"; return 0; fi
+  info "no 7-Zip 21.02+ on this system; fetching the static build"
+  local tar
+  tar="$CACHE_DIR/$(basename "$SEVENZIP_URL")"
+  [[ -f "$tar" ]] || fetch "$tar" "$SEVENZIP_URL"
+  check_sha256 "$tar" "$SEVENZIP_SHA256"
+  tar xf "$tar" -C "$CACHE_DIR" 7zz
+  chmod +x "$bin"
+  printf '%s\n' "$bin"
+}
+
+# Pick the newest g++ that is at least version 11 (Electron's headers need
+# C++20) and the gcc that goes with it.
+find_compiler() {
+  local c v best='' best_v=0
+  while IFS= read -r c; do
+    v=$("$c" -dumpversion 2>/dev/null | cut -d. -f1) || continue
+    [[ "$v" =~ ^[0-9]+$ ]] || continue
+    if (( v >= 11 && v > best_v )); then best=$c; best_v=$v; fi
+  done < <(compgen -c | grep -E '^g\+\+(-[0-9]+)?$' | sort -u)
+  [[ -n "$best" ]] || die "need g++ 11 or newer"
+  CXX=$best
+  CC=${best/g++/gcc}
+  command -v "$CC" >/dev/null 2>&1 || CC=gcc
+  command -v "$CC" >/dev/null 2>&1 || CC=cc
+}
+
+# Extract one path from the disk image into $3 and fail if it did not exist:
+# 7-Zip exits 0 when a requested path is not in the archive.
+dmg_extract() {
+  local dmg=$1 path=$2 out=$3
+  "$SEVENZIP" e "$dmg" "$path" -o"$out" -y >/dev/null 2>&1 || die "could not read $dmg"
+  [[ -f "$out/$(basename "$path")" ]]
+}
+
+plist_string() {
+  # Print the string that follows key $2 in plist $1.
+  grep -A1 "<key>$2</key>" "$1" | grep -oE '<string>[^<]+' | head -1 | cut -c9-
+}
+
+installed_version() { [[ -f "$VERSION_FILE" ]] && sed -n 's/^granola=//p' "$VERSION_FILE"; }
+
+# Version and URL of the current release, from the redirect target.
+resolve_latest() {
+  local url
+  url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$LATEST_URL") || die "could not reach $LATEST_URL"
+  LATEST_URL_RESOLVED=$url
+  LATEST=$(basename "$url" | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+  [[ -n "$LATEST" ]] || die "could not read a version from $url"
+}
+
+# --- install ----------------------------------------------------------------
+
+cmd_install() {
+  while (( $# )); do
+    case $1 in
+      --dmg) DMG=${2:?--dmg needs a file}; shift ;;
+      --version) WANT_VERSION=${2:?--version needs a version}; shift ;;
+      --force) FORCE=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  [[ -z "$DMG" || -z "$WANT_VERSION" ]] || die "--dmg and --version exclude each other"
+  [[ "$(uname -m)" == x86_64 ]] || die "only x86_64 is supported (the image's native module is built for it)"
+
+  step "Checking prerequisites"
+  local c
+  for c in curl node npm python3 make tar sha256sum; do need_cmd "$c"; done
+  mkdir -p "$CACHE_DIR"
+  SEVENZIP=$(find_sevenzip)
+  find_compiler
+  info "7-Zip:    $SEVENZIP"
+  info "compiler: $CXX $("$CXX" -dumpversion), node $(node --version)"
+
+  step "Getting the disk image"
+  if [[ -n "$DMG" ]]; then
+    [[ -f "$DMG" ]] || die "no such file: $DMG"
+    info "using $DMG"
+  else
+    local url
+    if [[ -n "$WANT_VERSION" ]]; then
+      url="$RELEASE_BASE/$WANT_VERSION/Granola-$WANT_VERSION-mac-universal.dmg"
+    else
+      resolve_latest
+      url=$LATEST_URL_RESOLVED
+      info "current release: $LATEST"
+    fi
+    DMG="$CACHE_DIR/$(basename "$url")"
+    if [[ -f "$DMG" ]]; then
+      info "using cached $(basename "$DMG")"
+    elif (( DRY_RUN )); then
+      would "download $url"
+    else
+      fetch "$DMG" "$url"
+    fi
+  fi
+
+  local work="$CACHE_DIR/work"
+  rm -rf "$work"
+  mkdir -p "$work/plist"
+  local app_ver='' el_ver=''
+  if [[ -f "$DMG" ]]; then
+    if ! dmg_extract "$DMG" "$DMG_FRAMEWORK_PLIST" "$work/plist"; then
+      if "$SEVENZIP" l "$DMG" 2>/dev/null | grep -q 'Install Granola.app'; then
+        die "$DMG is Granola's stub installer, not the app. Run without --dmg to fetch the full image, or download it from $LATEST_URL"
+      fi
+      die "Granola.app not found in $DMG"
+    fi
+    el_ver=$(plist_string "$work/plist/Info.plist" CFBundleVersion)
+    rm -f "$work/plist/Info.plist"
+    dmg_extract "$DMG" "$DMG_APP/Info.plist" "$work/plist" || die "no app Info.plist in $DMG"
+    app_ver=$(plist_string "$work/plist/Info.plist" CFBundleShortVersionString)
+    [[ -n "$app_ver" && -n "$el_ver" ]] || die "could not read the versions from $DMG"
+    info "Granola $app_ver on Electron $el_ver"
+  fi
+
+  if [[ -n "$app_ver" && "$(installed_version)" == "$app_ver" ]] && (( ! FORCE )); then
+    info "Granola $app_ver is already installed; use --force to rebuild"
+    rm -rf "$work"
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    step "Dry run"
+    if [[ -z "$el_ver" ]]; then
+      would "read the Electron version from the image"
+      would "download that Electron release and verify it against SHASUMS256.txt"
+    else
+      would "download $ELECTRON_RELEASES/v$el_ver/electron-v$el_ver-linux-x64.zip and verify it"
+    fi
+    would "rebuild better-sqlite3-multiple-ciphers from the image's sources with $CXX and $NODE_GYP"
+    would "assemble the app in $CACHE_DIR/work and move it to $APP_DIR"
+    would "write $LAUNCHER, $BIN_DIR/granola, $DESKTOP_FILE and $ICON"
+    rm -rf "$work"
+    return 0
+  fi
+
+  step "Fetching Electron $el_ver for Linux"
+  local zip_name="electron-v$el_ver-linux-x64.zip"
+  local zip="$CACHE_DIR/$zip_name" sums="$CACHE_DIR/SHASUMS256-v$el_ver.txt"
+  [[ -f "$sums" ]] || fetch "$sums" "$ELECTRON_RELEASES/v$el_ver/SHASUMS256.txt"
+  [[ -f "$zip" ]] || fetch "$zip" "$ELECTRON_RELEASES/v$el_ver/$zip_name"
+  local want
+  want=$(grep " \*$zip_name\$" "$sums" | cut -d' ' -f1)
+  [[ -n "$want" ]] || die "$zip_name is not listed in Electron's SHASUMS256.txt"
+  check_sha256 "$zip" "$want"
+  info "checksum verified"
+
+  step "Extracting the app from the image"
+  "$SEVENZIP" x "$DMG" "$DMG_RES/app.asar" "$DMG_RES/app.asar.unpacked" "$DMG_RES/icons" -o"$work/dmg" -y >/dev/null \
+    || die "could not extract the app from $DMG"
+  local res="$work/dmg/$DMG_RES"
+  [[ -f "$res/app.asar" && -d "$res/app.asar.unpacked" ]] || die "the image holds no app.asar"
+
+  step "Building the native SQLite module"
+  # Granola ships a patched better-sqlite3-multiple-ciphers (it adds an
+  # updateHook method no public build has), with its full C++ source in
+  # app.asar.unpacked. Build that source. Only binding.gyp is missing from
+  # the image; npm supplies it from the release of the same version.
+  local mod='node_modules/better-sqlite3-multiple-ciphers'
+  local src="$res/app.asar.unpacked/$mod" build="$work/build"
+  local mod_ver
+  mod_ver=$(node -p "require('$src/package.json').version")
+  info "better-sqlite3-multiple-ciphers $mod_ver"
+  cp -r "$src" "$build"
+  ( cd "$work" && npm pack "better-sqlite3-multiple-ciphers@$mod_ver" --silent >/dev/null \
+      && tar xzf better-sqlite3-multiple-ciphers-*.tgz package/binding.gyp ) \
+    || die "could not fetch binding.gyp for better-sqlite3-multiple-ciphers@$mod_ver"
+  cp "$work/package/binding.gyp" "$build/"
+  ( cd "$build" && CC=$CC CXX=$CXX npm_config_devdir="$CACHE_DIR/node-gyp" \
+      npm exec --yes --package="$NODE_GYP" -- node-gyp rebuild --release \
+        --runtime=electron --target="$el_ver" --arch=x64 --dist-url="$ELECTRON_HEADERS" ) \
+    >"$work/build.log" 2>&1 || { tail -30 "$work/build.log" >&2; die "native build failed (log: $work/build.log)"; }
+  info "built"
+
+  step "Assembling the app"
+  local stage="$work/app"
+  mkdir -p "$stage"
+  "$SEVENZIP" x "$zip" -o"$stage" -y >/dev/null || die "could not unpack $zip"
+  chmod +x "$stage/electron" "$stage/chrome_crashpad_handler" "$stage/chrome-sandbox"
+  # Electron reports app.isPackaged as false when its binary is called
+  # "electron". Granola then runs as a development build: devtools, a
+  # "Not packaged" tray menu and the wrong icon path. Rename it.
+  mv "$stage/electron" "$stage/granola"
+  rm -f "$stage/resources/default_app.asar"
+  cp -r "$res/app.asar" "$res/app.asar.unpacked" "$res/icons" "$stage/resources/"
+  cp "$build/build/Release/better_sqlite3.node" "$stage/resources/app.asar.unpacked/$mod/build/Release/"
+  [[ -f "$build/build/Release/test_extension.node" ]] \
+    && cp "$build/build/Release/test_extension.node" "$stage/resources/app.asar.unpacked/$mod/build/Release/"
+  patch_platform "$stage/resources/app.asar"
+  patch_click_drag "$stage/resources/app.asar.unpacked/node_modules/electron-click-drag-plugin"
+  patch_tray_icons "$stage/resources/icons"
+
+  step "Testing the build"
+  smoke_test "$stage"
+
+  step "Installing to $ROOT"
+  mkdir -p "$ROOT"
+  rm -rf "$APP_DIR.old"
+  [[ -d "$APP_DIR" ]] && mv "$APP_DIR" "$APP_DIR.old"
+  mv "$stage" "$APP_DIR"
+  rm -rf "$APP_DIR.old"
+  printf 'granola=%s\nelectron=%s\n' "$app_ver" "$el_ver" >"$VERSION_FILE"
+  # The app icon is 763x763, a size no icon theme indexes, so the desktop
+  # entry names the file rather than an icon name.
+  cp "$APP_DIR/resources/icons/icon.png" "$ICON"
+  write_launcher
+  write_desktop_entry
+  rm -rf "$work"
+  check_sandbox
+
+  printf '\n%sGranola %s is installed.%s\n' "$c_bold" "$app_ver" "$c_off"
+  info "launch it from the app menu, or run: $BIN_DIR/granola"
+}
+
+# Granola's API answers 500 Internal Server Error to platform=linux, sign-in
+# included. The app maps darwin to macOS, win32 to Windows and passes any
+# other value through; make that fallback say Windows. The replacement has
+# the same byte length, padded with spaces, because the asar header records
+# every file's offset and size.
+patch_platform() {
+  local asar=$1
+  python3 -I - "$asar" <<'EOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+data = p.read_bytes()
+total = 0
+for prefix in (b"window.electron.platform", b"process.platform"):
+    old = b"?`Windows`:" + prefix
+    new = b"?`Windows`:`Windows`".ljust(len(old))
+    total += data.count(old)
+    data = data.replace(old, new)
+if not total:
+    sys.exit("no platform fallback found in app.asar; Granola's build output changed")
+p.write_bytes(data)
+print(f"    rewrote {total} platform fallback(s)")
+EOF
+}
+
+# The meeting indicator is a frameless window that Granola moves with a
+# native click-and-drag module. Its Linux build talks to X11 through Xlib;
+# under Wayland the window handle is not an X window and Xlib aborts the
+# whole app, dropping the transcript. Make the call a no-op on Wayland and
+# keep the real module for X11.
+patch_click_drag() {
+  local dir=$1
+  [[ -d "$dir" ]] || { warn "electron-click-drag-plugin not in this build; skipping"; return 0; }
+  cat >"$dir/index.js" <<'EOF'
+// Replaced by granola-linux. The native module below uses Xlib, which
+// aborts the process under Wayland. See granola-linux for the reasoning.
+'use strict';
+const path = require('path');
+let native = null;
+if (!process.env.WAYLAND_DISPLAY) {
+  try {
+    native = require(path.join(__dirname, 'build/Release/linux-x64/drag.node'));
+  } catch (e) {
+    native = null;
+  }
+}
+module.exports = {
+  startDrag(handle) {
+    if (native) {
+      try { native.startDrag(handle); } catch (e) { /* a drag is not worth a crash */ }
+    }
+  },
+};
+EOF
+  info "click-and-drag made safe on Wayland"
+}
+
+# The tray icons are macOS template images: black shapes that macOS tints
+# for the menu bar. Linux shows them as they are, invisible on a dark panel.
+# Use the coloured app icon instead; status-notifier trays scale it.
+patch_tray_icons() {
+  local dir=$1 f
+  [[ -f "$dir/icon.png" ]] || return 0
+  for f in iconTemplate.png iconTemplate@2x.png iconTemplate@3x.png; do
+    [[ -f "$dir/$f" ]] && cp "$dir/icon.png" "$dir/$f"
+  done
+  info "tray icon replaced with the app icon"
+}
+
+# Run the rebuilt module inside the installed Electron the way the app will:
+# open an encrypted database and check that updateHook fires.
+smoke_test() {
+  local stage=$1
+  local mod="$stage/resources/app.asar.unpacked/node_modules/better-sqlite3-multiple-ciphers"
+  local plugin="$stage/resources/app.asar.unpacked/node_modules/electron-click-drag-plugin"
+  local db="$CACHE_DIR/work/smoke.db"
+  # The module finds its binary through 'bindings', which lives in app.asar.
+  ELECTRON_RUN_AS_NODE=1 NODE_PATH="$stage/resources/app.asar/node_modules" "$stage/granola" -e "
+    const Database = require(process.argv[1]);
+    const db = new Database(process.argv[2]);
+    db.pragma(\"cipher='sqlcipher'\");
+    db.pragma(\"key='smoke'\");
+    db.exec('CREATE TABLE t(a)');
+    let fired = false;
+    db.updateHook(() => { fired = true; });
+    db.prepare('INSERT INTO t VALUES (1)').run();
+    if (db.prepare('SELECT count(*) c FROM t').get().c !== 1) throw new Error('insert failed');
+    if (!fired) throw new Error('updateHook did not fire');
+    db.close();
+    process.env.WAYLAND_DISPLAY = 'smoke';
+    require(process.argv[3]).startDrag(Buffer.alloc(8));
+  " "$mod/lib/index.js" "$db" "$plugin/index.js" || die "smoke test failed; the app would not start"
+  rm -f "$db"
+  info "encrypted database, updateHook and the drag stub work"
+}
+
+write_launcher() {
+  cat >"$LAUNCHER" <<EOF
+#!/bin/sh
+# Granola launcher written by granola-linux.
+# --ozone-platform-hint=auto: native Wayland when there is a Wayland display.
+# WebRTCPipeWireCapturer: screen and audio capture through the desktop portal.
+exec "$APP_DIR/granola" --ozone-platform-hint=auto --enable-features=WebRTCPipeWireCapturer "\$@"
+EOF
+  chmod +x "$LAUNCHER"
+  mkdir -p "$BIN_DIR"
+  ln -sfn "$LAUNCHER" "$BIN_DIR/granola"
+}
+
+write_desktop_entry() {
+  mkdir -p "$(dirname "$DESKTOP_FILE")"
+  cat >"$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Granola
+Comment=AI notepad for meetings
+Exec=$LAUNCHER %U
+Icon=$ICON
+Terminal=false
+Categories=Office;
+Keywords=meeting;notes;transcript;
+StartupNotify=true
+StartupWMClass=granola
+MimeType=x-scheme-handler/granola;
+EOF
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null || true
+  fi
+  # Sign-in ends with the browser opening a granola:// link.
+  if command -v xdg-mime >/dev/null 2>&1; then
+    xdg-mime default "$(basename "$DESKTOP_FILE")" x-scheme-handler/granola 2>/dev/null || true
+  fi
+}
+
+# Chromium sandboxes its renderers with unprivileged user namespaces. Where
+# a distribution turns those off it falls back to the setuid chrome-sandbox
+# helper, which a user-owned install cannot provide, and the app aborts.
+# Say so instead of silently installing something that will not start.
+check_sandbox() {
+  local userns apparmor
+  userns=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo 1)
+  apparmor=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)
+  if [[ "$userns" == 0 || "$apparmor" == 1 ]]; then
+    warn "this system restricts unprivileged user namespaces, so Chromium needs its setuid sandbox helper."
+    warn "As root, either run: chown root:root '$APP_DIR/chrome-sandbox' && chmod 4755 '$APP_DIR/chrome-sandbox'"
+    warn "or, on Ubuntu, add an AppArmor profile with the userns permission for '$APP_DIR/granola'."
+    warn "This must be repeated after every install, since the app directory is replaced."
+  fi
+}
+
+# --- uninstall --------------------------------------------------------------
+
+cmd_uninstall() {
+  local purge=0
+  while (( $# )); do
+    case $1 in
+      --purge) purge=1 ;;
+      --yes) ASSUME_YES=1 ;;
+      --dry-run) DRY_RUN=1 ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  local targets=("$ROOT" "$BIN_DIR/granola" "$DESKTOP_FILE")
+  (( purge )) && targets+=("$USER_DATA")
+  echo "This removes:"
+  printf '  %s\n' "${targets[@]}"
+  if (( DRY_RUN )); then would "remove the paths above"; return 0; fi
+  if (( ! ASSUME_YES )); then
+    read -rp "Continue? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 0; }
+  fi
+  pkill -f "^$APP_DIR/granola" 2>/dev/null || true
+  rm -rf "${targets[@]}"
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$(dirname "$DESKTOP_FILE")" 2>/dev/null || true
+  fi
+  echo "Done."
+}
+
+# --- status -----------------------------------------------------------------
+
+cmd_status() {
+  local have
+  have=$(installed_version || true)
+  if [[ -z "$have" ]]; then
+    echo "Granola is not installed by granola-linux."
+  else
+    echo "installed: Granola $have (Electron $(sed -n 's/^electron=//p' "$VERSION_FILE"))"
+    echo "app:       $APP_DIR"
+    echo "launcher:  $BIN_DIR/granola"
+    echo "user data: $USER_DATA"
+  fi
+  if resolve_latest 2>/dev/null; then
+    if [[ "$LATEST" == "$have" ]]; then
+      echo "release:   $LATEST (up to date)"
+    else
+      echo "release:   $LATEST (run 'granola-linux install' to update)"
+    fi
+  else
+    echo "release:   could not reach $LATEST_URL"
+  fi
+}
+
+# --- main -------------------------------------------------------------------
+
+main() {
+  local cmd=${1:-help}
+  shift || true
+  case $cmd in
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    status) cmd_status "$@" ;;
+    help|-h|--help) usage ;;
+    --version) echo "granola-linux $VERSION" ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
