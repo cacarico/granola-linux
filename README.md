@@ -1,116 +1,153 @@
 # granola-linux
 
-Run [Granola](https://www.granola.ai), the AI meeting notepad, natively on
-Linux. Granola ships for macOS and Windows only, but it is an Electron app:
-its macOS disk image holds the app's JavaScript next to a macOS Electron
-runtime. `granola-linux` pairs that JavaScript with the matching Linux
-Electron runtime, rebuilds the one native module Granola needs from the
-sources in the image, and patches what keeps it from running. No Wine, no
-virtual machine.
+`granola-linux` installs [Granola](https://www.granola.ai), the AI meeting
+notepad, on a Linux desktop. Granola publishes builds for macOS and Windows
+only. Its macOS disk image, however, is an Electron bundle: the app itself is
+JavaScript, and the only parts tied to macOS are the Electron runtime it is
+packed with and one native SQLite module. This script downloads that image
+from Granola's own release endpoint, pairs the JavaScript with the Linux
+Electron release of the same version, builds the SQLite module for Linux from
+the sources in the image, applies three small fixes, and installs the result
+under your home directory with a desktop entry and a launcher.
 
-This is an unofficial compatibility project, not affiliated with Granola.
-It redistributes nothing of Granola's: the image comes from Granola's own
-release endpoint, and you sign in with your own account.
+This is an unofficial compatibility project. It is not affiliated with
+Granola and it redistributes none of Granola's files: every install fetches
+the image from Granola, and you sign in with your own account.
 
 ## Install
 
-You need x86-64 Linux, `curl`, `python3`, `node` and `npm`, `make`, and
-`g++` 11 or newer. A 7-Zip of version 21.02 or newer is used if present
-(the `7zip` package on Arch, `7zip` on Debian 13 and Ubuntu 24.04 and
-newer); otherwise the static build from 7-zip.org is fetched and checked
-against the checksum pinned in the script.
+Requirements: x86-64 Linux, `curl`, `python3`, `node` and `npm`, `make`, and
+`g++` 11 or newer. Reading the disk image needs 7-Zip 21.02 or newer (the
+`7zip` package on Arch, Debian 13 and Ubuntu 24.04 or later). Without one,
+the script fetches the static build from 7-zip.org and checks it against a
+checksum pinned in the script. The `p7zip` most distributions still ship
+cannot read the image's compression.
 
 ```sh
 git clone https://github.com/cacarico/granola-linux
 cd granola-linux
-make install DRY_RUN=1   # shows what would happen
-make install             # downloads the current release and installs it
+make install DRY_RUN=1   # prints what would happen, changes nothing
+make install             # installs the current release
 ```
 
-Then open Granola from the app menu, or run `~/.local/bin/granola`, and
-sign in. Sign-in opens in your browser and comes back through a
-`granola://` link, which the install registers.
+Start Granola from the application menu or with `~/.local/bin/granola`.
+Sign-in opens in your browser and returns to the app through a `granola://`
+link; the install registers the handler for it.
 
-To update, run `make install` again: it does nothing if the installed
-version is current. `./granola-linux install --dmg FILE` uses an image you
-already have, `--version 7.668.3` picks a release, `--force` rebuilds the
-installed one. `make uninstall` removes the install and keeps your notes;
-`./granola-linux uninstall --purge` removes those too.
+## Day to day
 
-Nothing needs root. The install lives under `~/.local/share/granola-linux`,
-downloads under `~/.cache/granola-linux`, and Granola's own data under
-`~/.config/Granola`, as the official app would.
+- `make status` shows the installed version and whether Granola has released
+  a newer one.
+- `make install` again updates. It stops early when the installed version is
+  current; `./granola-linux install --force` rebuilds it anyway.
+- `./granola-linux install --version 7.668.3` installs a specific release, and
+  `--dmg FILE` builds from an image you already have.
+- `make uninstall` removes the app and keeps your notes.
+  `./granola-linux uninstall --purge` removes Granola's data too.
 
-## What works
+Everything is written as your user: the app under
+`~/.local/share/granola-linux`, downloads under `~/.cache/granola-linux`, and
+Granola's own data under `~/.config/Granola`, where the official app keeps it.
+The `GRANOLA_LINUX_HOME`, `GRANOLA_LINUX_CACHE` and `GRANOLA_LINUX_BIN_DIR`
+variables move the install root, the download cache and the launcher link.
 
-| | |
-|---|---|
-| ✅ | Notes, editor, sync, AI features and search |
-| ✅ | Sign-in with Google, Microsoft or SSO |
-| ✅ | The encrypted local database |
-| ✅ | Microphone recording |
-| ✅ | Native Wayland and X11 |
-| ⚠️ | System audio capture. The macOS build hears the other side of a call through Core Audio; on Linux the app falls back to a browser-style capture path. |
-| ❌ | Apple Calendar. Google and Microsoft calendars work, since those run on the server. |
-| ❌ | Global hotkeys |
-| ❌ | Auto-update. Run `make install` again. |
+## What to expect
 
-## How it works
+Granola runs as the real app, not a development build: notes, sync, the AI
+features, search and sign-in behave as they do on macOS, and the local
+database is encrypted the same way. Microphone recording and transcription
+work. The app runs natively on Wayland as well as X11, including the floating
+meeting indicator, which on an unpatched build aborts the whole app under
+Wayland.
 
-The conversion is six steps, each with its reasoning in the script:
+Some things are different from the macOS build:
 
-1. Read the Electron version from the image and download that release's
-   Linux build from Electron's GitHub releases. The zip is verified against
-   the `SHASUMS256.txt` published next to it.
-2. Copy `app.asar`, `app.asar.unpacked` and the icons from the image into
-   the runtime. The macOS native binaries stay behind; the app guards them
-   with platform checks.
-3. Rebuild `better-sqlite3-multiple-ciphers` for Linux. Granola ships a
-   patched fork with an `updateHook` method that no public build has, and
-   the fork's C++ source is in the image. Only `binding.gyp` is missing;
-   it comes from the npm release of the same version. The build uses the
-   Electron headers for the exact runtime version.
-4. Patch the platform label inside `app.asar`. Granola's API answers 500
-   to `platform=linux`, sign-in included, so the fallback that would say
-   `linux` says `Windows` instead. The replacement is byte-for-byte the
-   same length, because the asar header records file offsets.
-5. Make the click-and-drag module a no-op under Wayland. The meeting
-   indicator window uses it, and its Linux build talks to X11 through
-   Xlib, which aborts the whole app on a Wayland window handle.
-6. Rename the Electron binary to `granola`, so that `app.isPackaged` is
-   true and Granola does not run as a development build, and replace the
-   macOS tray template icons with the coloured app icon.
+- Capture of the other side of a call. On macOS Granola taps system audio
+  through Core Audio. The Linux runtime has no such path, so the launcher
+  turns on Chromium's PipeWire capturer and the app records what the desktop
+  portal offers it.
+- Granola's auto-update is off. The installed version is pinned; `make
+  status` tells you when a new release is out and `make install` brings it
+  in.
+- Features that call macOS frameworks directly, such as the Apple Calendar
+  integration, do not exist on Linux. Google and Microsoft calendars are
+  unaffected because they are handled on Granola's servers.
+- System-wide keyboard shortcuts have not been tested here. Electron
+  registers them through the window system, and Wayland compositors do not
+  offer that to applications.
 
-A failed build never touches a working install: the app is assembled and
-smoke-tested in the cache directory, then swapped into place.
+## Under the hood
 
-Some distributions restrict unprivileged user namespaces, which Chromium
-needs for its sandbox; the install then prints the root command that
-configures the setuid sandbox helper instead of running it.
+Every step has a comment in the script that says what breaks without it,
+so the conversion can be redone by hand from the comments alone. In outline:
 
-## Safety
+**The image.** Granola's download page serves a small stub that fetches the
+app at first launch on macOS, which is useless here. The script follows
+Granola's release endpoint to the full image instead, and refuses the stub
+with an explanation if one is passed with `--dmg`. The Electron version and
+the app version are read from the image's property lists.
 
-Read the script before you run it; it is one file. It runs nothing as root,
-downloads only from 7-zip.org, Electron's GitHub releases, electronjs.org,
-the npm registry and Granola's release host, and verifies every download
-against a published or pinned checksum, except Granola's own image, for
-which Granola publishes none.
+**The runtime.** The Linux build of that exact Electron version comes from
+Electron's GitHub releases and is verified against the `SHASUMS256.txt`
+published beside it. The app archive, its unpacked native modules and the
+icons are copied from the image into the runtime; the macOS binaries stay
+behind, since the app only loads them on macOS. The Electron binary is
+renamed `granola`, because an Electron binary called `electron` reports the
+app as unpackaged and Granola then runs with developer tooling and a "Not
+packaged" tray menu.
 
-Granola's user terms forbid reverse engineering its software. This project
-changes one string and one module's entry point in a build you downloaded
-yourself; whether that is acceptable to you and to Granola is your call.
+**The SQLite module.** Granola uses a fork of `better-sqlite3-multiple-ciphers`
+with an `updateHook` method that no published build has. The fork's C++
+source ships in the image; only `binding.gyp` is missing, and npm supplies it
+from the release of the same version. The module is compiled against the
+Electron headers for the installed runtime, with the newest `g++` of version
+11 or later on the system.
+
+**Three patches.**
+
+- The platform label. Granola's API returns an error for `platform=linux`,
+  which blocks sign-in. The app's fallback for unknown platforms is rewritten
+  to say `Windows`, with the same byte length, since the archive header
+  records every file's offset.
+- The click-and-drag module. The meeting indicator window is moved with a
+  native module whose Linux build calls Xlib. Under Wayland that aborts the
+  process. Its entry point is replaced with one that uses the native module on
+  X11 and does nothing on Wayland.
+- The tray icons. The macOS tray images are black template shapes that only
+  macOS tints; on a dark Linux panel they are invisible. The coloured app icon
+  takes their place.
+
+**The safety net.** The rebuilt module and the drag stub are run inside the
+installed Electron before anything is installed: the test opens an encrypted
+database, checks that `updateHook` fires, and calls the stub under a Wayland
+display. Only then is the new app swapped into place, so a failed build never
+replaces a working one. If the system restricts unprivileged user namespaces,
+which Chromium's sandbox needs, the script prints the root command that
+enables the setuid sandbox helper rather than running anything as root.
+
+## Safety and terms
+
+The script is one file; read it before running it. It never runs as root. It
+downloads from Granola's release host, Electron's GitHub releases,
+electronjs.org, the npm registry and, when needed, 7-zip.org. Every download
+except Granola's own image is checked against a published or pinned checksum;
+Granola publishes none for its image.
+
+Granola's terms of use forbid reverse engineering its software. This project
+changes one string and one module's entry point in a copy you downloaded
+yourself. Whether that is acceptable to you is your decision.
 
 ## Acknowledgements
 
-The approach, running the macOS bundle on the Linux Electron runtime,
-patching the platform label and rebuilding the SQLite module from the
-sources in the image, was worked out and documented by
+Running the macOS bundle on the Linux Electron runtime, patching the platform
+label and rebuilding the SQLite module from the sources in the image was
+worked out and documented by
 [tirtha4/Granola-for-Linux](https://github.com/tirtha4/Granola-for-Linux).
-The stub-installer check, the checksum verification of the Electron
-download, the binary rename and the Wayland fix for the click-and-drag
-module were first proposed in that repository's pull requests by regrog,
-jason-c-dev and shawnyeager. This project is a new implementation of those
-ideas; it shares no code with them.
+The stub-installer check, checksum verification of the Electron download,
+the binary rename and the Wayland fix for the click-and-drag module were
+first proposed in that repository's pull requests by regrog, jason-c-dev and
+shawnyeager. This project is a fresh implementation of those ideas and shares
+no code with them.
 
 ## License
 
