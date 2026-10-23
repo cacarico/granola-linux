@@ -100,6 +100,18 @@ Granola's user terms forbid reverse engineering its software. This project
 changes one string and one module's entry point in a build you downloaded
 yourself; whether that is acceptable to you and to Granola is your call.
 
+## Acknowledgements
+
+The approach, running the macOS bundle on the Linux Electron runtime,
+patching the platform label and rebuilding the SQLite module from the
+sources in the image, was worked out and documented by
+[tirtha4/Granola-for-Linux](https://github.com/tirtha4/Granola-for-Linux).
+The stub-installer check, the checksum verification of the Electron
+download, the binary rename and the Wayland fix for the click-and-drag
+module were first proposed in that repository's pull requests by regrog,
+jason-c-dev and shawnyeager. This project is a new implementation of those
+ideas; it shares no code with them.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
