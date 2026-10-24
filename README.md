@@ -7,7 +7,7 @@ JavaScript, and the only parts tied to macOS are the Electron runtime it is
 packed with and one native SQLite module. This script downloads that image
 from Granola's own release endpoint, pairs the JavaScript with the Linux
 Electron release of the same version, builds the SQLite module for Linux from
-the sources in the image, applies three small fixes, and installs the result
+the sources in the image, applies a few small fixes, and installs the result
 under your home directory with a desktop entry and a launcher.
 
 This is an unofficial compatibility project. It is not affiliated with
@@ -103,12 +103,17 @@ from the release of the same version. The module is compiled against the
 Electron headers for the installed runtime, with the newest `g++` of version
 11 or later on the system.
 
-**Three patches.**
+**The patches.**
 
 - The platform label. Granola's API returns an error for `platform=linux`,
   which blocks sign-in. The app's fallback for unknown platforms is rewritten
   to say `Windows`, with the same byte length, since the archive header
-  records every file's offset.
+  records every file's offset. This is what the API sees, so Granola's own
+  device list may show the install as Windows.
+- The echo-cancellation notice. Granola cancels echo through Core Audio on
+  macOS and treats every other platform as Windows, so the transcript view
+  would say the feature is in beta on Windows. The notice stays, since it is
+  true here as well, and names Linux instead.
 - The click-and-drag module. The meeting indicator window is moved with a
   native module whose Linux build calls Xlib. Under Wayland that aborts the
   process. Its entry point is replaced with one that uses the native module on

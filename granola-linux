@@ -334,7 +334,7 @@ cmd_install() {
   cp "$build/build/Release/better_sqlite3.node" "$stage/resources/app.asar.unpacked/$mod/build/Release/"
   [[ -f "$build/build/Release/test_extension.node" ]] \
     && cp "$build/build/Release/test_extension.node" "$stage/resources/app.asar.unpacked/$mod/build/Release/"
-  patch_platform "$stage/resources/app.asar"
+  patch_asar "$stage/resources/app.asar"
   patch_click_drag "$stage/resources/app.asar.unpacked/node_modules/electron-click-drag-plugin"
   patch_tray_icons "$stage/resources/icons"
 
@@ -360,27 +360,49 @@ cmd_install() {
   info "launch it from the app menu, or run: $BIN_DIR/granola"
 }
 
-# Granola's API answers 500 Internal Server Error to platform=linux, sign-in
-# included. The app maps darwin to macOS, win32 to Windows and passes any
-# other value through; make that fallback say Windows. The replacement has
-# the same byte length, padded with spaces, because the asar header records
+# Two string rewrites inside app.asar. Each replacement is padded with
+# spaces to the byte length of the original, because the asar header records
 # every file's offset and size.
-patch_platform() {
+#
+# The platform label: Granola's API answers 500 Internal Server Error to
+# platform=linux, sign-in included. The app maps darwin to macOS, win32 to
+# Windows and passes any other value through; make that fallback say Windows.
+#
+# The echo-cancellation notice: Granola cancels echo through Core Audio on
+# macOS and treats every other platform as Windows, so on Linux the
+# transcript view shows "Echo cancellation is in beta on Windows". The notice
+# is right, the OS name is not; relabel it. Trailing spaces inside the text
+# collapse when the page renders. Unlike the platform label this one is not
+# required, since Granola may reword it.
+patch_asar() {
   local asar=$1
   python3 -I - "$asar" <<'EOF'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])
 data = p.read_bytes()
+
+def rewrite(old, new):
+    global data
+    n = data.count(old)
+    data = data.replace(old, new.ljust(len(old)))
+    return n
+
 total = 0
 for prefix in (b"window.electron.platform", b"process.platform"):
-    old = b"?`Windows`:" + prefix
-    new = b"?`Windows`:`Windows`".ljust(len(old))
-    total += data.count(old)
-    data = data.replace(old, new)
+    total += rewrite(b"?`Windows`:" + prefix, b"?`Windows`:`Windows`")
 if not total:
     sys.exit("no platform fallback found in app.asar; Granola's build output changed")
-p.write_bytes(data)
 print(f"    rewrote {total} platform fallback(s)")
+
+labels = [
+    (b"Echo cancellation is in beta on Windows", b"Echo cancellation is in beta on Linux"),
+]
+for old, new in labels:
+    if rewrite(old, new):
+        print(f"    relabelled: {new.decode()}")
+    else:
+        print(f"    not in this build, left alone: {old.decode()}")
+p.write_bytes(data)
 EOF
 }
 
